@@ -1,0 +1,6 @@
+[workspace]
+members = [
+"decomposer",
+"partial_order_alignment",
+"bio_utils",
+]

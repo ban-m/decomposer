@@ -1,0 +1,17 @@
+[package]
+name = "decomposer"
+version = "0.1.0"
+authors = ["ban-m <ban-m@g.ecc.u-tokyo.ac.jp>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+poa_hmm = {path = "../partial_order_alignment"}
+bio_utils = {path = "../bio_utils"}
+rayon = "*"
+rand = "*"
+rand_xoshiro = "*"
+log = "*"
+clap = "*"
+env_logger = "*"
