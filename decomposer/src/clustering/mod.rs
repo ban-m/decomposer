@@ -9,6 +9,7 @@ const SMALL_WEIGHT: f64 = 0.000_000_000_0001;
 const GIBBS_PRIOR: f64 = 0.00;
 const STABLE_LIMIT: u32 = 8;
 const IS_STABLE: u32 = 5;
+const REPNUM: usize = 5;
 
 pub struct AlnParam<F>
 where
@@ -46,33 +47,34 @@ pub const DEFAULT_ALN: AlnParam<fn(u8, u8) -> i32> = AlnParam {
 fn get_models<F, R>(
     data: &[Record],
     assignments: &[u8],
-    sampled: &[bool],
     cluster_num: usize,
     rng: &mut R,
     param: (i32, i32, &F),
     pick: f64,
-) -> Vec<POA>
+) -> Vec<Vec<POA>>
 where
     R: Rng,
     F: Fn(u8, u8) -> i32 + std::marker::Sync,
 {
     let mut chunks: Vec<_> = vec![vec![]; cluster_num];
     let choises: Vec<u8> = (0..cluster_num).map(|e| e as u8).collect();
-    for ((read, &asn), &b) in data.iter().zip(assignments.iter()).zip(sampled) {
-        if !b {
-            if let Ok(&chosen) =
-                choises.choose_weighted(rng, |&k| if k == asn { 1. + pick } else { pick })
-            {
-                chunks[chosen as usize].push(read.seq());
-            }
+    for (read, &asn) in data.iter().zip(assignments.iter()) {
+        if let Ok(&chosen) =
+            choises.choose_weighted(rng, |&k| if k == asn { 1. + pick } else { pick })
+        {
+            chunks[chosen as usize].push(read.seq());
         }
     }
-    let seeds: Vec<_> = rng.sample_iter(Standard).take(cluster_num).collect();
+    let seeds: Vec<u64> = rng.sample_iter(Standard).take(cluster_num).collect();
     chunks
         .par_iter()
         .zip(seeds.into_par_iter())
         .map(|(cluster, seed)| {
-            POA::default().update(cluster, &vec![1.; cluster.len()], param, seed)
+            (0..REPNUM)
+                .into_par_iter()
+                .map(|s| s as u64 + seed)
+                .map(|s| POA::default().update(cluster, &vec![1.; cluster.len()], param, s))
+                .collect()
         })
         .collect()
 }
@@ -85,10 +87,9 @@ fn logsumexp(xs: &[f64]) -> f64 {
 }
 
 fn update_assignments<R: Rng>(
-    models: &[POA],
+    models: &[Vec<POA>],
     assignments: &mut [u8],
     data: &[Record],
-    sampled: &[bool],
     rng: &mut R,
     cluster_num: usize,
     config: &Config,
@@ -101,16 +102,20 @@ fn update_assignments<R: Rng>(
         .collect();
     let seeds: Vec<u64> = rng.sample_iter(Standard).take(data.len()).collect();
     assignments
-        .iter_mut()
-        .zip(data.iter())
-        .zip(seeds.into_iter())
-        .zip(sampled.iter())
-        .filter(|&(_, &b)| b)
-        .map(|(((asn, read), s), _)| {
+        .par_iter_mut()
+        .zip(data.par_iter())
+        .zip(seeds.into_par_iter())
+        .map(|((asn, read), s)| {
             let likelihoods: Vec<_> = models
                 .par_iter()
                 .zip(fractions.par_iter())
-                .map(|(m, &q)| m.forward(read.seq(), &config) * beta + q.ln())
+                .map(|(ms, &q)| {
+                    let lks: Vec<_> = ms
+                        .iter()
+                        .map(|m| m.forward(read.seq(), &config) * beta)
+                        .collect();
+                    logsumexp(&lks) - (REPNUM as f64).ln() + q.ln()
+                })
                 .collect();
             let total = logsumexp(&likelihoods);
             let mut rng: Xoshiro256StarStar = SeedableRng::seed_from_u64(s);
@@ -139,24 +144,15 @@ where
     if cluster_num <= 1 || data.len() <= 2 {
         return vec![None; data.len()];
     }
-    let lim = limit / 3;
-    let times = vec![0.005, 0.05, 0.10];
     let sum = data
         .iter()
         .flat_map(|e| e.id().bytes())
         .map(|e| e as u64)
         .sum::<u64>()
         + 1;
-    let mut assignments = vec![];
-    for (seed, pick_prob) in times.into_iter().enumerate() {
-        let params = (lim, pick_prob, seed as u64 * sum);
-        let (res, end) = gibbs_sampling_inner(data, cluster_num, params, config, aln);
-        assignments = res;
-        if end {
-            break;
-        }
-    }
-    assignments
+    let params = (limit, 0.05, 10 as u64 * sum);
+    let (res, _) = gibbs_sampling_inner(data, cluster_num, params, config, aln);
+    res
 }
 
 fn print_lk_gibbs<F>(
@@ -170,10 +166,9 @@ fn print_lk_gibbs<F>(
 ) where
     F: Fn(u8, u8) -> i32 + std::marker::Sync,
 {
-    let falses = vec![false; data.len()];
     let mut rng: Xoshiro256StarStar = SeedableRng::seed_from_u64(id);
     let rng = &mut rng;
-    let models = get_models(data, asns, &falses, cluster_num, rng, param, 0.);
+    let models = get_models(data, asns, cluster_num, rng, param, 0.);
     let fractions: Vec<f64> = (0..cluster_num)
         .map(|cl| asns.iter().filter(|&&e| e == cl as u8).count())
         .map(|count| count as f64 / data.len() as f64 + SMALL_WEIGHT)
@@ -212,13 +207,15 @@ where
     }
     while count < STABLE_LIMIT {
         beta *= BETA_INCREASE;
-        let changed_num = (0..pick_prob.recip().ceil() as usize / 2)
-            .map(|_| {
-                let s: Vec<bool> = (0..data.len()).map(|_| rng.gen_bool(pick_prob)).collect();
-                let ms = get_models(&data, asn, &s, cluster_num, rng, param, GIBBS_PRIOR);
-                update_assignments(&ms, asn, &data, &s, rng, cluster_num, config, beta)
-            })
-            .sum::<u32>();
+        let changed_num = {
+            let ms: Vec<_> = get_models(&data, asn, cluster_num, rng, param, GIBBS_PRIOR);
+            for (idx, ms) in ms.iter().enumerate() {
+                for (jdx, m) in ms.iter().enumerate() {
+                    debug!("{}\t{}\t{}", idx, jdx, m);
+                }
+            }
+            update_assignments(&ms, asn, &data, rng, cluster_num, config, beta)
+        };
         debug!("CHANGENUM\t{}", changed_num);
         if changed_num <= (data.len() as u32 / 50).max(2) {
             count += 1;
@@ -286,11 +283,14 @@ fn report_gibbs(asn: &[u8], lp: u32, id: u64, cl: usize, beta: f64) {
     info!("Summary\t{}\t{}\t{:.3}\t{}", id, lp, beta, line.join("\t"));
 }
 
-fn calc_probs(models: &[POA], read: &Record, c: &Config, fractions: &[f64]) -> Vec<f64> {
+fn calc_probs(models: &[Vec<POA>], read: &Record, c: &Config, fractions: &[f64]) -> Vec<f64> {
     let likelihoods: Vec<_> = models
         .par_iter()
         .zip(fractions.par_iter())
-        .map(|(m, f)| m.forward(read.seq(), c) + f.ln())
+        .map(|(ms, f)| {
+            let lks: Vec<_> = ms.par_iter().map(|m| m.forward(read.seq(), c)).collect();
+            logsumexp(&lks) - (REPNUM as f64).ln() + f.ln()
+        })
         .collect();
     let t = logsumexp(&likelihoods);
     likelihoods.iter().map(|l| (l - t).exp()).collect()
@@ -337,8 +337,7 @@ where
     let param = (aln.ins, aln.del, &aln.score);
     let mut rng: Xoshiro256StarStar = SeedableRng::seed_from_u64(seed);
     let rng = &mut rng;
-    let falses = vec![false; data.len()];
-    let models = get_models(&data, &labels, &falses, cluster_num, rng, param, 0.);
+    let models = get_models(&data, &labels, cluster_num, rng, param, 0.);
     let choises: Vec<_> = (0..cluster_num).map(|e| e as u8).collect();
     let fractions: Vec<f64> = (0..cluster_num)
         .map(|cl| labels.iter().filter(|&&e| e == cl as u8).count())

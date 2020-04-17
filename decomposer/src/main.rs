@@ -4,12 +4,14 @@ extern crate clap;
 extern crate log;
 extern crate decomposer;
 extern crate env_logger;
-use clap::{App, Arg, SubCommand};
+use clap::{App, Arg};
 use decomposer::*;
-fn subcommand_decompose() -> App<'static, 'static> {
-    SubCommand::with_name("decompose")
+fn decompose_app() -> App<'static, 'static> {
+    App::new("MMMM")
         .version("0.1")
-        .about("To Decompose long reads")
+        .author("Bansho Masutani")
+        .about("Softwares to Decompose long reads.")
+        .version("0.1")
         .arg(
             Arg::with_name("reads")
                 .required(true)
@@ -107,14 +109,7 @@ fn decompose(matches: &clap::ArgMatches) -> std::io::Result<()> {
 }
 
 fn main() -> std::io::Result<()> {
-    let matches = App::new("MMMM")
-        .version("0.1")
-        .author("Bansho Masutani")
-        .about("Softwares to Decompose long reads.")
-        .subcommand(subcommand_decompose())
-        .get_matches();
-    match matches.subcommand() {
-        ("decompose", Some(sub_m)) => decompose(sub_m),
-        _ => Ok(()),
-    }
+    let app = decompose_app();
+    let matches = app.get_matches();
+    decompose(&matches)
 }
